@@ -11,7 +11,6 @@ try:
 except:
     print("Fatal: can't import git.config. GitPython is missing (try to install python3-git)?", file=sys.stderr)
     exit(1)
-from git.repo import Repo
 from typing import Any
 import argparse
 from typing import Dict, List, Optional
@@ -45,7 +44,8 @@ class NvConfigs:
     }
 
     def __init__(self):
-        self.config = Repo(path=None).config_writer(config_level="global")
+        global_config_path = os.path.expanduser("~/.gitconfig")
+        self.config = GitConfigParser(global_config_path, read_only=False)
         self.values = {}
         for var in self.vars:
             current_value = self.GetConfig(var)
