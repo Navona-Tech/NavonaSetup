@@ -12,8 +12,10 @@ wget https://raw.githubusercontent.com/Navona-Tech/NavonaSetup/refs/heads/main/N
 
 curl https://raw.githubusercontent.com/Navona-Tech/NavonaSetup/refs/heads/main/Navanoa-Setup
 
-or use the browser to download it
 ```
+or use the browser to download it
+
+https://raw.githubusercontent.com/Navona-Tech/NavonaSetup/refs/heads/main/Navanoa-Setup
 
 # Run it
 
