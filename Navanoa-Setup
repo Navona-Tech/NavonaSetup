@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+
+# Copyright 2026 Navona-Tech, shahar.frankel@navona.tech
+
+import datetime
+import os
+import sys
+
+try:
+    from git.config import GitConfigParser
+except:
+    print("Fatal: can't import git.config. GitPython is missing (try to install python3-git)?", file=sys.stderr)
+    exit(1)
+from git.repo import Repo
+from typing import Any
+import argparse
+from typing import Dict, List, Optional
+
+# Global scripts directory
+nvscripts_dir = "~/navona-scripts"
+gitkeyname = "github-navona-tech"
+github_account = "Navona-Tech"
+github_remote = "github"
+scripts_repo = "navona-scripts"
+
+
+class NvConfigs:
+    vars: dict[str, tuple[str, str, str, Any]] = {
+        "user.name": ("Your full name", "user", "name", ""),
+        "user.email": ("Your email address", "user", "email", ""),
+        "core.editor": ("Your preferred text editor", "core", "editor", "vim"),
+        "init.defaultbranch": ("Default branch name", "init", "defaultBranch", "main"),
+        "merge.branchdesc": ("Show branch description in merge commit messages", "merge", "branchdesc", "true"),
+        "github.user": ("Your GitHub username", "github", "user", ""),
+        "github.account": ("Your GitHub account name", "github", "account", github_account),
+        "core.hookspath": ("Path to your the global git hooks", "core", "hooksPath", f"{nvscripts_dir}/githooks"),
+        "push.autoSetupRemote": ("Create branches on remote by default", "push", "autoSetupRemote", "true"),
+        # "remote.github.fetch": (
+        #    "Fetch all remote branches",
+        #    'remote "github"',
+        #    "fetch",
+        #    "+refs/heads/*:refs/remotes/github/*",
+        # ),
+        # "test.value": ("Test value", "test", "value", "gogo"),
+    }
+
+    def __init__(self):
+        self.config = Repo(path=None).config_writer(config_level="global")
+        self.values = {}
+        for var in self.vars:
+            current_value = self.GetConfig(var)
+            self.values[var] = current_value
+
+    def GetConfig(self, var) -> int | float | str | bool | None:
+        """Get current global git configuration values."""
+        if not var in self.vars:
+            raise ValueError(f"Invalid variable: {var}")
+        return self.config.get_value(self.vars[var][1], self.vars[var][2], "")
+
+    def Prompt(self, var: str, current_value: Any = None) -> str:
+        """Prompt user for a git config value."""
+        if current_value == None or current_value == "":
+            prompt = f"[Missing] Enter a value for '{var}' [{self.vars[var][3]}]: "
+        else:
+            prompt = f"[Update] Enter a value to update '{var}' [{current_value}]: "
+        return input(prompt).strip()
+
+    def Update(self, force: bool = False, force_vars: dict[str, Any] | None = None) -> bool:
+        updated = False
+        if force_vars == None:
+            force_vars = {}
+        for var in self.vars:
+            current_value = self.GetConfig(var) if var not in force_vars else force_vars[var]
+            if not current_value or force or var in force_vars:
+                v = self.Prompt(var, current_value)
+                if not v:
+                    v = current_value if current_value else self.GetDefault(var)
+                if v != self.GetConfig(var):
+                    updated = True
+                self.values[var] = v
+        return updated
+
+    def SetDefault(self, var: str, value: Any):
+        record = self.vars.get(var, None)
+        assert record is not None, f"Invalid variable: {var}"
+        self.vars[var] = (record[0], record[1], record[2], value)
+
+    def GetDefault(self, var: str) -> Any:
+        return self.vars[var][3]
+
+    def Show(self, title: str):
+        print("### ", title)
+        for var in self.vars:
+            print(f"\t{var}: {self.values[var]}")
+
+    def YesNo(self, prompt: str, def_input: bool = False) -> bool:
+        if def_input:
+            prompt = prompt + " [Y/n]: "
+        else:
+            prompt = prompt + " [y/N]: "
+        while True:
+            user_input = input("### " + prompt).strip()
+            if user_input == "y" or user_input == "Y" or (user_input == "" and def_input == True):
+                return True
+            elif user_input == "n" or user_input == "N" or (user_input == "" and def_input == False):
+                return False
+            else:
+                print("### Invalid input, please enter y or n")
+
+    def Save(self, force: bool = False):
+        for var in self.vars:
+            if self.values[var]:
+                self.config.set_value(self.vars[var][1], self.vars[var][2], self.values[var])
+        self.config.release()
+
+
+def SetupSshKey(nv_configs: NvConfigs):
+    # Generate ssh key
+    email = nv_configs.GetConfig("user.email")
+    ssh_dir = os.path.expanduser("~/.ssh")
+    ssh_keyfile = os.path.join(ssh_dir, gitkeyname)
+    ssh_config_file = os.path.join(ssh_dir, "config")
+    os.system(f"ssh-keygen -C '{email}' -f {ssh_keyfile}")
+    backup_file = os.path.join(ssh_dir, f"config.{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    os.system(f"cp {ssh_config_file} {backup_file}")
+    with open(ssh_config_file, "a") as f:
+        f.write(
+            f"\nHost {gitkeyname}\n  HostName github.com\n  User git\n  IdentityFile {ssh_keyfile}\n  IdentitiesOnly yes\n"
+        )
+    os.chmod(ssh_config_file, 0o600)
+    print(f"### Created ssh key {gitkeyname}, original config saved to {backup_file}")
+    # Print out the public key and ask the user to add it to the github account deploy keys with write perm
+    print(f"### Public key: {ssh_keyfile}.pub")
+    print(f"### Add the following key to the {github_account} deploy keys with write perm!")
+    with open(ssh_keyfile + ".pub", "r") as f:
+        print(f"{f.read()}")
+
+    if nv_configs.YesNo(f"Did you add the key to the {github_account} deploy keys with write perm?"):
+        print(f"### Good, continuing with setup...")
+    else:
+        print(f"### Aborting... Can't continue")
+        exit(1)
+
+
+def CloneScriptsRepository(scripts_dir: str, gitaccount: str):
+    # clone the nvscripts repository under the scripts_dir
+    gitcmd = f"git clone git@{gitkeyname}:{github_account}/{scripts_repo}.git --origin {github_remote} {scripts_dir}"
+    print(f"### {gitcmd}")
+    ret = os.system(gitcmd)
+    if ret != 0:
+        raise Exception(f"### Failed to clone nvscripts repository under {scripts_dir}")
+
+    print(f"### Cloned nvscripts repository under {scripts_dir}")
+    # Ensure scripts_dir is in the path, if not add it to the bashrc
+    if scripts_dir not in os.environ["PATH"]:
+        with open(os.path.expanduser("~/.bashrc"), "a") as f:
+            ret = f.write(f"\n# nvScripts: Add {scripts_dir} to the path\nexport PATH={scripts_dir}:$PATH\n")
+            if ret <= 0:
+                raise Exception(f"### Failed to add {scripts_dir} to the path")
+    print(f"### Added {scripts_dir} to the path")
+
+
+def CreateBinDirectory(bin_dir: str):
+    if not os.path.exists(bin_dir):
+        os.makedirs(bin_dir)
+        print(f"### Created {bin_dir} directory")
+    if bin_dir not in os.environ["PATH"]:
+        with open(os.path.expanduser("~/.bashrc"), "a") as f:
+            ret = f.write(f"\n# nvScripts: Add {bin_dir} to the path\nexport PATH={bin_dir}:$PATH\n")
+            if ret <= 0:
+                raise Exception(f"### Failed to add {bin_dir} to the path")
+    print(f"### Added {bin_dir} to the path")
+
+
+def UpdateConfig(update: bool) -> NvConfigs:
+    nv_configs = NvConfigs()
+    nv_configs.Show("Current configuration")
+    print("\n### Completing/Updating configuration...\n")
+    if nv_configs.Update(update):
+        nv_configs.Show("Updated configuration")
+        if nv_configs.YesNo("Save configuration?", def_input=True):
+            nv_configs.Save()
+        else:
+            print("\n### Abort changes.\n")
+    else:
+        print("### No changes has been made.\n")
+    return nv_configs
+
+
+def CheckConfig(nv_configs: NvConfigs) -> Dict[str, Any]:
+    # Check that the git user ends with "-navona". If not, ask to update the configuration
+    missing_vars = {}
+    for var in nv_configs.vars:
+        value = nv_configs.GetConfig(var)
+        if not value:
+            print(f"### Error: mandatory {var} is missing.")
+            missing_vars[var] = nv_configs.GetDefault(var)
+
+    gituser = nv_configs.GetConfig("github.user")
+    user = nv_configs.GetConfig("user.name")
+    assert isinstance(user, str)
+    assert isinstance(gituser, str)
+    if not gituser.endswith("-navona") and user:
+        suggested_gituser = user.lower().replace(" ", "") + "-navona"
+        print(f"### Error: git user {gituser} does not end with '-navona'!. Suggested name: {suggested_gituser}")
+        missing_vars["github.user"] = suggested_gituser
+    return missing_vars
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Setup git global configuration")
+    parser.add_argument("-u", "--update", action="store_true", help="Update existing configuration values")
+    args = parser.parse_args()
+
+    try:
+        # First Init/Update the configuration
+        nv_configs = UpdateConfig(args.update)
+
+        # Check that the configuration is complete and valide
+        while missing_vars := CheckConfig(nv_configs):
+            if nv_configs.YesNo(f"\nUpdate the configuration to fix?", def_input=True):
+                if nv_configs.Update(force_vars=missing_vars):
+                    if nv_configs.YesNo("Save configuration?", def_input=True):
+                        nv_configs.Save()
+                    else:
+                        print("\n### Abort changes.\n")
+                        exit(1)
+
+        print("### Configuration is valid. Continuing with setup...")
+        # Check if ~/bin exists, if not create it, anyhow check that it is in the path
+        bin_dir = os.path.expanduser("~/bin")
+        if not os.path.exists(bin_dir):
+            if nv_configs.YesNo(f"Create ~/bin directory and add it to the path?", def_input=True):
+                CreateBinDirectory(bin_dir)
+
+        # Check that the ssh key github-navona-tech exists
+        if not os.path.exists(os.path.expanduser(f"~/.ssh/{gitkeyname}")):
+            if nv_configs.YesNo(f"Create ssh key {gitkeyname}?", def_input=True):
+                SetupSshKey(nv_configs)
+                print(f"### Created ssh key {gitkeyname}, added to ssh config")
+        else:
+            print(f"### SSH key {gitkeyname} already exists")
+
+        # Create global navona scripts directory if it doesn't exist
+        scripts_dir = os.path.expanduser(nvscripts_dir)
+        gitaccount = nv_configs.GetConfig("github.account")
+        assert isinstance(gitaccount, str) and gitaccount != "", f"github.account is not set/bad {gitaccount}"
+        if not os.path.exists(scripts_dir):
+            if nv_configs.YesNo(
+                f"Clone nvscripts repository under {scripts_dir} (also used for global git hooks)?", def_input=True
+            ):
+                CloneScriptsRepository(scripts_dir, gitaccount)
+        else:
+            print(f"### nvscripts repository already exists under {scripts_dir}")
+
+        # Check global git hooks
+        hookspath = nv_configs.GetConfig("core.hookspath")
+        assert isinstance(hookspath, str) and hookspath != "", f"core.hookspath is not set/bad {hookspath}"
+        gitpath = os.path.expanduser(hookspath)
+        if not os.path.exists(gitpath):
+            os.makedirs(gitpath)
+            print(f"## Warning: {hookspath} directory does not exist! (clone nvn-scripts)")
+        else:
+            print(f"### Global git hooks directory {gitpath} exists")
+
+        if not os.path.exists(os.path.join(gitpath, "navona-tech-pre-commit")):
+            print(
+                f"## Warning: {os.path.join(gitpath, "navona-tech-pre-commit")} file does not exist! (clone nvn-scripts)"
+            )
+        else:
+            print(f"### Global git hooks file {os.path.join(gitpath, "navona-tech-pre-commit")} exists")
+
+        print("\n### Setup completed successfully.")
+        print(f"   - Read {os.path.join(scripts_dir, "README.md")} file for more information.\n")
+
+    except KeyboardInterrupt:
+        print("\n### Setup aborted.\n")
+
+
+if __name__ == "__main__":
+    main()
