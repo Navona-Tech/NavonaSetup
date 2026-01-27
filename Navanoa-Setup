@@ -171,6 +171,26 @@ def CreateBinDirectory(bin_dir: str):
                 raise Exception(f"### Failed to add {bin_dir} to the path")
     print(f"### Added {bin_dir} to the path")
 
+def UpdatePromptWithGitBranch(nv_configs: NvConfigs):
+    prompt = '''# Git Branch Prompt - By NavonaSetup
+if [ -z "$NVSetupPrompt" ]; then
+	NVSetupPrompt="yes"
+	parse_git_branch() {
+     		git branch 2> /dev/null | sed -e '/^[^*]/d' -e 's/* \(.*\)/(\1)/'
+	}
+	export PS1="\u@\h: \[\e[32m\]\w \[\e[91m\]\$(parse_git_branch)\[\e[00m\]$ "
+fi
+'''
+    # Check if the prompt is already in the .bashrc
+    with open(os.path.expanduser("~/.bashrc"), "r") as f:
+        if "NVSetupPrompt" in f.read():
+            print(f"### Prompt with git branch already exists in .bashrc")
+            return
+
+    # Add the prompt to the .bashrc
+    with open(os.path.expanduser("~/.bashrc"), "a") as f:
+        f.write(prompt)
+    print(f"### Added prompt with git branch to .bashrc")
 
 def UpdateConfig(update: bool) -> NvConfigs:
     nv_configs = NvConfigs()
@@ -263,6 +283,10 @@ def main():
         else:
             print(f"### Global git hooks directory {gitpath} exists")
 
+        # Update the prompt with git branch
+        UpdatePromptWithGitBranch(nv_configs)
+
+        # Check that the pre-commit hook exists
         if not os.path.exists(os.path.join(gitpath, "navona-tech-pre-commit")):
             print(
                 f"## Warning: {os.path.join(gitpath, "navona-tech-pre-commit")} file does not exist! (clone nvn-scripts)"
