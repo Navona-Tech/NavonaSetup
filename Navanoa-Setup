@@ -172,7 +172,7 @@ def CreateBinDirectory(bin_dir: str):
     print(f"### Added {bin_dir} to the path")
 
 def UpdatePromptWithGitBranch(nv_configs: NvConfigs):
-    prompt = '''# Git Branch Prompt - By NavonaSetup
+    prompt = r'''# Git Branch Prompt - By NavonaSetup
 if [ -z "$NVSetupPrompt" ]; then
 	NVSetupPrompt="yes"
 	parse_git_branch() {
