@@ -8,8 +8,11 @@ Download the initial setup script
 ```bash
 wget https://raw.githubusercontent.com/Navona-Tech/NavonaSetup/refs/heads/main/Navanoa-Setup
 
-# or 
+```
 
+or 
+
+```bash
 curl https://raw.githubusercontent.com/Navona-Tech/NavonaSetup/refs/heads/main/Navanoa-Setup
 
 ```
@@ -23,5 +26,9 @@ https://raw.githubusercontent.com/Navona-Tech/NavonaSetup/refs/heads/main/Navano
 # If you used the browser to download, the file is your downloads directory
 cd <download location>
 chmod +x NavonaSetup
+
+# Required by NavonaSetup script
+sudo apt install python3-git
+
 ./NavonaSetup
 ```
