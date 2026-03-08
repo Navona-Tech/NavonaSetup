@@ -297,6 +297,12 @@ def main():
                 CloneScriptsRepository(scripts_dir, gitaccount)
         else:
             print(f"### nvscripts repository already exists under {scripts_dir}")
+            # Pull latest changes to ensure navona-scripts is up to date
+            ret = os.system(f"git -C {scripts_dir} pull --rebase")
+            if ret != 0:
+                print(f"## Warning: Failed to update navona-scripts in {scripts_dir}")
+            else:
+                print(f"### Updated navona-scripts to latest version")
 
         # Install Claude-related files (skills, plugins, etc.) from navona-scripts
         if os.path.isdir(os.path.join(scripts_dir, "claude")):
