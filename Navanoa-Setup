@@ -13,6 +13,7 @@ except:
     exit(1)
 from typing import Any
 import argparse
+import shutil
 from typing import Dict, List, Optional
 
 # Global scripts directory
@@ -207,6 +208,30 @@ def UpdateConfig(update: bool) -> NvConfigs:
     return nv_configs
 
 
+def InstallClaudeFiles(scripts_dir: str):
+    """Install Claude-related files (skills, plugins, etc.) from navona-scripts to ~/.claude/."""
+    claude_src = os.path.join(scripts_dir, "claude")
+    claude_dst = os.path.expanduser("~/.claude")
+
+    if not os.path.isdir(claude_src):
+        print(f"### No claude directory found in {scripts_dir}, skipping")
+        return
+
+    # Walk the source claude directory and copy all files, preserving subdirectory structure
+    for dirpath, dirnames, filenames in os.walk(claude_src):
+        for filename in filenames:
+            src_file = os.path.join(dirpath, filename)
+            rel_path = os.path.relpath(src_file, claude_src)
+            dst_file = os.path.join(claude_dst, rel_path)
+            dst_dir = os.path.dirname(dst_file)
+            if not os.path.exists(dst_dir):
+                os.makedirs(dst_dir)
+            shutil.copy2(src_file, dst_file)
+            print(f"###   Installed {rel_path}")
+
+    print(f"### Claude files installed from {claude_src} to {claude_dst}")
+
+
 def CheckConfig(nv_configs: NvConfigs) -> Dict[str, Any]:
     # Check that the git user ends with "-navona". If not, ask to update the configuration
     missing_vars = {}
@@ -272,6 +297,13 @@ def main():
                 CloneScriptsRepository(scripts_dir, gitaccount)
         else:
             print(f"### nvscripts repository already exists under {scripts_dir}")
+
+        # Install Claude-related files (skills, plugins, etc.) from navona-scripts
+        if os.path.isdir(os.path.join(scripts_dir, "claude")):
+            if nv_configs.YesNo("Install Claude Code files (skills, plugins) from navona-scripts?", def_input=True):
+                InstallClaudeFiles(scripts_dir)
+        else:
+            print(f"### No Claude files found in {scripts_dir}")
 
         # Check global git hooks
         hookspath = nv_configs.GetConfig("core.hookspath")
