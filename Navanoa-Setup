@@ -13,6 +13,7 @@ except:
     exit(1)
 from typing import Any
 import argparse
+import getpass
 import shutil
 from typing import Dict, List, Optional
 
@@ -143,9 +144,85 @@ def SetupSshKey(nv_configs: NvConfigs):
         exit(1)
 
 
-def CloneScriptsRepository(scripts_dir: str, gitaccount: str):
+def SetupPatToken(nv_configs: NvConfigs) -> str:
+    """Guide the user to create a GitHub Personal Access Token and configure git to use it."""
+    print("""
+### ---- GitHub Personal Access Token Setup ----
+###
+### To generate a fine-grained Personal Access Token:
+###
+###  1. Go to https://github.com/settings/tokens?type=beta
+###  2. Click "Generate new token"
+###  3. Set a descriptive name (e.g., "navona-dev-machine")
+###  4. Set expiration as needed (recommended: 90 days or more)
+###  5. Under "Resource owner", select "Navona-Tech"
+###  6. Under "Repository access", select "All repositories"
+###     (or select specific repos: at minimum "navona-scripts" and your target repos)
+###  7. Under "Permissions" -> "Repository permissions", grant:
+###     - Contents: Read and write
+###     - Metadata: Read-only (auto-selected)
+###  8. Click "Generate token" and copy the token
+###
+### -----------------------------------------------""")
+
+    token = getpass.getpass("### Paste your Personal Access Token (input is hidden): ").strip()
+    if not token:
+        print("### Error: No token provided. Aborting.")
+        exit(1)
+
+    # Configure git credential helper to store the token
+    git_credentials_file = os.path.expanduser("~/.git-credentials")
+    credential_entry = f"https://{nv_configs.values['github.user']}:{token}@github.com"
+
+    # Read existing credentials and check if there's already an entry for github.com
+    existing_lines = []
+    if os.path.exists(git_credentials_file):
+        with open(git_credentials_file, "r") as f:
+            existing_lines = f.readlines()
+
+    # Replace any existing github.com entry, or append the new one
+    updated = False
+    new_lines = []
+    for line in existing_lines:
+        if "github.com" in line:
+            new_lines.append(credential_entry + "\n")
+            updated = True
+        else:
+            new_lines.append(line)
+    if not updated:
+        new_lines.append(credential_entry + "\n")
+
+    with open(git_credentials_file, "w") as f:
+        f.writelines(new_lines)
+    os.chmod(git_credentials_file, 0o600)
+
+    # Set git credential helper to store
+    os.system("git config --global credential.helper store")
+
+    print(f"### Token saved to {git_credentials_file} and credential helper configured.")
+
+    # Verify the token works by testing access to the GitHub API
+    print("### Verifying token access to GitHub...")
+    ret = os.system(
+        f'git ls-remote https://github.com/{github_account}/{scripts_repo}.git HEAD > /dev/null 2>&1'
+    )
+    if ret != 0:
+        print(f"### Error: Could not access {github_account}/{scripts_repo} with the provided token.")
+        if not nv_configs.YesNo("Continue anyway?"):
+            exit(1)
+    else:
+        print(f"### Token verified — access to {github_account}/{scripts_repo} confirmed.")
+
+    return token
+
+
+def CloneScriptsRepository(scripts_dir: str, gitaccount: str, use_pat: bool = False):
     # clone the nvscripts repository under the scripts_dir
-    gitcmd = f"git clone git@{gitkeyname}:{github_account}/{scripts_repo}.git --origin {github_remote} {scripts_dir}"
+    if use_pat:
+        repo_url = f"https://github.com/{github_account}/{scripts_repo}.git"
+    else:
+        repo_url = f"git@{gitkeyname}:{github_account}/{scripts_repo}.git"
+    gitcmd = f"git clone {repo_url} --origin {github_remote} {scripts_dir}"
     print(f"### {gitcmd}")
     ret = os.system(gitcmd)
     if ret != 0:
@@ -252,10 +329,33 @@ def CheckConfig(nv_configs: NvConfigs) -> Dict[str, Any]:
     return missing_vars
 
 
+def CheckRequiredTools():
+    """Check that required CLI tools are installed."""
+    missing = []
+    for tool, install_hint in [
+        ("git", "sudo apt install git"),
+        ("gh", "sudo apt install gh  (or see https://cli.github.com)"),
+    ]:
+        if not shutil.which(tool):
+            missing.append((tool, install_hint))
+    if missing:
+        print("### Error: The following required tools are not installed:", file=sys.stderr)
+        for tool, hint in missing:
+            print(f"###   {tool} — install with: {hint}", file=sys.stderr)
+        exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Setup git global configuration")
     parser.add_argument("-u", "--update", action="store_true", help="Update existing configuration values")
+    parser.add_argument(
+        "--pat",
+        action="store_true",
+        help="Use a Personal Access Token (PAT) for GitHub authentication instead of SSH key",
+    )
     args = parser.parse_args()
+
+    CheckRequiredTools()
 
     try:
         # First Init/Update the configuration
@@ -278,13 +378,18 @@ def main():
             if nv_configs.YesNo(f"Create ~/bin directory and add it to the path?", def_input=True):
                 CreateBinDirectory(bin_dir)
 
-        # Check that the ssh key github-navona-tech exists
-        if not os.path.exists(os.path.expanduser(f"~/.ssh/{gitkeyname}")):
-            if nv_configs.YesNo(f"Create ssh key {gitkeyname}?", def_input=True):
-                SetupSshKey(nv_configs)
-                print(f"### Created ssh key {gitkeyname}, added to ssh config")
+        # Setup GitHub authentication (SSH key or PAT)
+        use_pat = args.pat
+        if use_pat:
+            if nv_configs.YesNo("Setup Personal Access Token (PAT) for GitHub?", def_input=True):
+                SetupPatToken(nv_configs)
         else:
-            print(f"### SSH key {gitkeyname} already exists")
+            if not os.path.exists(os.path.expanduser(f"~/.ssh/{gitkeyname}")):
+                if nv_configs.YesNo(f"Create ssh key {gitkeyname}?", def_input=True):
+                    SetupSshKey(nv_configs)
+                    print(f"### Created ssh key {gitkeyname}, added to ssh config")
+            else:
+                print(f"### SSH key {gitkeyname} already exists")
 
         # Create global navona scripts directory if it doesn't exist
         scripts_dir = os.path.expanduser(nvscripts_dir)
@@ -294,7 +399,7 @@ def main():
             if nv_configs.YesNo(
                 f"Clone nvscripts repository under {scripts_dir} (also used for global git hooks)?", def_input=True
             ):
-                CloneScriptsRepository(scripts_dir, gitaccount)
+                CloneScriptsRepository(scripts_dir, gitaccount, use_pat=use_pat)
         else:
             print(f"### nvscripts repository already exists under {scripts_dir}")
             # Pull latest changes to ensure navona-scripts is up to date
