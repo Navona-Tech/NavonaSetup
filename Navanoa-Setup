@@ -329,13 +329,13 @@ def CheckConfig(nv_configs: NvConfigs) -> Dict[str, Any]:
     return missing_vars
 
 
-def CheckRequiredTools():
+def CheckRequiredTools(use_pat: bool = False):
     """Check that required CLI tools are installed."""
+    required = [("git", "sudo apt install git")]
+    if use_pat:
+        required.append(("gh", "sudo apt install gh  (or see https://cli.github.com)"))
     missing = []
-    for tool, install_hint in [
-        ("git", "sudo apt install git"),
-        ("gh", "sudo apt install gh  (or see https://cli.github.com)"),
-    ]:
+    for tool, install_hint in required:
         if not shutil.which(tool):
             missing.append((tool, install_hint))
     if missing:
@@ -355,7 +355,7 @@ def main():
     )
     args = parser.parse_args()
 
-    CheckRequiredTools()
+    CheckRequiredTools(use_pat=args.pat)
 
     try:
         # First Init/Update the configuration
