@@ -29,7 +29,7 @@ chmod +x Navanoa-Setup
 
 # Required tools
 sudo apt install git python3-git
-sudo apt install gh  # or see https://cli.github.com
+sudo apt install gh  # required only for --pat mode (or see https://cli.github.com)
 
 # Run with SSH key authentication (default)
 ./Navanoa-Setup
