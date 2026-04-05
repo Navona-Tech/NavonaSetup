@@ -25,10 +25,18 @@ https://raw.githubusercontent.com/Navona-Tech/NavonaSetup/refs/heads/main/Navano
 ```bash
 # If you used the browser to download, the file is your downloads directory
 cd <download location>
-chmod +x NavonaSetup
+chmod +x Navanoa-Setup
 
-# Required by NavonaSetup script
-sudo apt install python3-git
+# Required tools
+sudo apt install git python3-git
+sudo apt install gh  # or see https://cli.github.com
 
-./NavonaSetup
+# Run with SSH key authentication (default)
+./Navanoa-Setup
+
+# Or run with Personal Access Token authentication
+./Navanoa-Setup --pat
+
+# Re-run and force update all config values
+./Navanoa-Setup -u
 ```
