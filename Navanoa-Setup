@@ -15,6 +15,8 @@ from typing import Any
 import argparse
 import getpass
 import shutil
+import subprocess
+import urllib.parse
 from typing import Dict, List, Optional
 
 # Global scripts directory
@@ -23,6 +25,24 @@ gitkeyname = "github-navona-tech"
 github_account = "Navona-Tech"
 github_remote = "github"
 scripts_repo = "navona-scripts"
+setup_repo = "NavonaSetup"
+
+# GitHub access over HTTPS (PAT authentication)
+github_https_base = "https://github.com/"
+github_credentials_file = "~/.git-credentials"
+# SSH url forms that are rewritten to HTTPS when working with a PAT, so that repositories
+# and scripts that hardcode the SSH host alias (nvgitinit, mkgithub.sh, existing clones)
+# keep working without any change.
+ssh_url_prefixes = [
+    f"git@{gitkeyname}:",
+    f"ssh://git@{gitkeyname}/",
+    "git@github.com:",
+    "ssh://git@github.com/",
+]
+
+# Authentication methods
+auth_pat = "pat"
+auth_ssh = "ssh"
 
 
 class NvConfigs:
@@ -113,7 +133,88 @@ class NvConfigs:
         for var in self.vars:
             if self.values[var]:
                 self.config.set_value(self.vars[var][1], self.vars[var][2], self.values[var])
+        self.Release()
+
+    def Release(self):
+        """Flush and unlock ~/.gitconfig.
+
+        GitConfigParser holds a ~/.gitconfig.lock while it is open for writing, which makes
+        every 'git config --global ...' call fail. It must be released before any git command
+        that writes the global configuration is invoked. Releasing twice is harmless, and the
+        already parsed values remain readable afterwards.
+        """
         self.config.release()
+
+
+def RunGit(args: List[str], quiet: bool = False) -> int:
+    """Run a git command, returning its exit code (never prompts for credentials)."""
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    out = subprocess.DEVNULL if quiet else None
+    return subprocess.call(["git"] + args, env=env, stdout=out, stderr=out)
+
+
+def GitConfigGet(key: str) -> str:
+    """Read a single global git config value ('' when unset)."""
+    res = subprocess.run(["git", "config", "--global", "--get", key], capture_output=True, text=True)
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def GitConfigSet(key: str, value: str) -> bool:
+    if RunGit(["config", "--global", key, value]) != 0:
+        print(f"### Error: failed to set git config {key}", file=sys.stderr)
+        return False
+    return True
+
+
+def GitConfigUnsetAll(key: str):
+    """Unset a (possibly multi-valued) global git config key, ignoring 'not set' errors."""
+    RunGit(["config", "--global", "--unset-all", key], quiet=True)
+
+
+def GetAuthMethod(nv_configs: NvConfigs, args: argparse.Namespace) -> str:
+    """Resolve the GitHub authentication method: explicit flag, stored choice, or ask."""
+    if args.pat and args.ssh:
+        print("### Error: --pat and --ssh are mutually exclusive.", file=sys.stderr)
+        exit(1)
+    if args.pat:
+        method = auth_pat
+    elif args.ssh:
+        method = auth_ssh
+    else:
+        method = GitConfigGet("github.authmethod")
+        if method not in (auth_pat, auth_ssh):
+            # No stored choice: infer from what is already configured, otherwise ask.
+            if HasPatCredentials():
+                method = auth_pat
+            elif os.path.exists(os.path.expanduser(f"~/.ssh/{gitkeyname}")):
+                method = auth_ssh
+            else:
+                method = (
+                    auth_pat
+                    if nv_configs.YesNo(
+                        "Use a GitHub Personal Access Token over HTTPS? (answer 'n' for an SSH key)", def_input=True
+                    )
+                    else auth_ssh
+                )
+    GitConfigSet("github.authmethod", method)
+    print(f"### GitHub authentication method: {method}")
+    return method
+
+
+def HasPatCredentials() -> bool:
+    """True when a github.com entry already exists in the git credentials store."""
+    credentials_file = os.path.expanduser(github_credentials_file)
+    if not os.path.exists(credentials_file):
+        return False
+    with open(credentials_file, "r") as f:
+        return any("@github.com" in line for line in f)
+
+
+def RepoUrl(repo: str, gitaccount: str, use_pat: bool) -> str:
+    """Build the clone url for a repository of the GitHub account."""
+    if use_pat:
+        return f"{github_https_base}{gitaccount}/{repo}.git"
+    return f"git@{gitkeyname}:{gitaccount}/{repo}.git"
 
 
 def SetupSshKey(nv_configs: NvConfigs):
@@ -144,7 +245,42 @@ def SetupSshKey(nv_configs: NvConfigs):
         exit(1)
 
 
-def SetupPatToken(nv_configs: NvConfigs) -> str:
+def ConfigureHttpsRewrites():
+    """Make git use HTTPS (with the PAT) for every SSH-style GitHub url.
+
+    The nv* scripts and existing clones use the 'git@github-navona-tech:' host alias. Rewriting
+    it to HTTPS means every repository - navona-scripts, NavonaSetup and any project repo -
+    is accessed with the PAT, without touching a single remote.
+    """
+    key = f"url.{github_https_base}.insteadOf"
+    GitConfigUnsetAll(key)
+    for prefix in ssh_url_prefixes:
+        RunGit(["config", "--global", "--add", key, prefix])
+    print(f"### Configured git to use {github_https_base} instead of: {', '.join(ssh_url_prefixes)}")
+
+
+def RemoveHttpsRewrites():
+    """Drop the HTTPS url rewrites so that SSH urls are used as-is again."""
+    key = f"url.{github_https_base}.insteadOf"
+    if GitConfigGet(key):
+        GitConfigUnsetAll(key)
+        print(f"### Removed the HTTPS url rewrites (SSH urls are used as-is)")
+
+
+def VerifyGitHubAccess(gitaccount: str, repos: List[str]) -> bool:
+    """Check that the configured credentials give access to the given repositories."""
+    ok = True
+    for repo in repos:
+        url = f"{github_https_base}{gitaccount}/{repo}.git"
+        if RunGit(["ls-remote", url, "HEAD"], quiet=True) != 0:
+            print(f"### Error: could not access {gitaccount}/{repo} over HTTPS.")
+            ok = False
+        else:
+            print(f"### Access to {gitaccount}/{repo} confirmed.")
+    return ok
+
+
+def SetupPatToken(nv_configs: NvConfigs, gitaccount: str) -> str:
     """Guide the user to create a GitHub Personal Access Token and configure git to use it."""
     print("""
 ### ---- GitHub Personal Access Token Setup ----
@@ -155,29 +291,72 @@ def SetupPatToken(nv_configs: NvConfigs) -> str:
 ###  2. Click "Generate new token"
 ###  3. Set a descriptive name (e.g., "navona-dev-machine")
 ###  4. Set expiration as needed (recommended: 90 days or more)
-###  5. Under "Resource owner", select "Navona-Tech"
+###  5. Under "Resource owner", select "{account}"
 ###  6. Under "Repository access", select "All repositories"
-###     (or select specific repos: at minimum "navona-scripts" and your target repos)
+###     (or "Only select repositories" and pick "{scripts}", "{setup}"
+###      and every repository you are going to work on)
 ###  7. Under "Permissions" -> "Repository permissions", grant:
 ###     - Contents: Read and write
 ###     - Metadata: Read-only (auto-selected)
+###
+### Required access levels:
+###   - "{scripts}" and "{setup}": at least READ access (Contents: Read-only)
+###     -> they are only cloned/pulled by this setup and by the nv* scripts
+###   - any additional repository you want to work on: READ AND WRITE access
+###     (Contents: Read and write) -> needed to push branches, commit and release
+###
 ###  8. Click "Generate token" and copy the token
 ###
-### -----------------------------------------------""")
+### The token may also be passed in the GITHUB_TOKEN environment variable.
+### -----------------------------------------------""".format(account=gitaccount, scripts=scripts_repo, setup=setup_repo),
+        flush=True,
+    )
 
-    token = getpass.getpass("### Paste your Personal Access Token (input is hidden): ").strip()
-    if not token:
-        print("### Error: No token provided. Aborting.")
-        exit(1)
+    env_token = os.environ.get("GITHUB_TOKEN", "").strip()
+    while True:
+        token = ""
+        if env_token:
+            if nv_configs.YesNo("Use the token found in the GITHUB_TOKEN environment variable?", def_input=True):
+                print("### Using the token from GITHUB_TOKEN")
+                token = env_token
+            env_token = ""  # only offer it once
+        if not token:
+            token = getpass.getpass("### Paste your Personal Access Token (input is hidden): ").strip()
+        if not token:
+            print("### Error: No token provided. Aborting.")
+            exit(1)
 
-    # Configure git credential helper to store the token
-    git_credentials_file = os.path.expanduser("~/.git-credentials")
-    credential_entry = f"https://{nv_configs.values['github.user']}:{token}@github.com"
+        StorePatToken(nv_configs, token)
+        ConfigureHttpsRewrites()
+        SetupGhCli(nv_configs, token)
+
+        # Verify the token gives access to the repositories the workflow depends on
+        print("### Verifying token access to GitHub...")
+        if VerifyGitHubAccess(gitaccount, [scripts_repo, setup_repo]):
+            return token
+
+        print("### The token is invalid, expired, or was not granted access to the repositories above.")
+        print("### Note: git drops a rejected token from the credentials store, so it must be entered again.")
+        if nv_configs.YesNo("Enter another Personal Access Token?", def_input=True):
+            continue
+        if not nv_configs.YesNo("Continue anyway?"):
+            exit(1)
+        return token
+
+
+def StorePatToken(nv_configs: NvConfigs, token: str):
+    """Save the token in the git credentials store and enable the 'store' credential helper."""
+    credentials_file = os.path.expanduser(github_credentials_file)
+    gituser = nv_configs.values.get("github.user") or GitConfigGet("github.user") or "x-access-token"
+    # The user/token are part of a url, so they must be percent encoded
+    credential_entry = (
+        f"https://{urllib.parse.quote(str(gituser), safe='')}:{urllib.parse.quote(token, safe='')}@github.com"
+    )
 
     # Read existing credentials and check if there's already an entry for github.com
     existing_lines = []
-    if os.path.exists(git_credentials_file):
-        with open(git_credentials_file, "r") as f:
+    if os.path.exists(credentials_file):
+        with open(credentials_file, "r") as f:
             existing_lines = f.readlines()
 
     # Replace any existing github.com entry, or append the new one
@@ -185,48 +364,51 @@ def SetupPatToken(nv_configs: NvConfigs) -> str:
     new_lines = []
     for line in existing_lines:
         if "github.com" in line:
-            new_lines.append(credential_entry + "\n")
-            updated = True
+            if not updated:
+                new_lines.append(credential_entry + "\n")
+                updated = True
         else:
             new_lines.append(line)
     if not updated:
         new_lines.append(credential_entry + "\n")
 
-    with open(git_credentials_file, "w") as f:
+    with open(credentials_file, "w") as f:
         f.writelines(new_lines)
-    os.chmod(git_credentials_file, 0o600)
+    os.chmod(credentials_file, 0o600)
 
-    # Set git credential helper to store
-    os.system("git config --global credential.helper store")
+    # Set git credential helper to store (fails if ~/.gitconfig is still locked, see NvConfigs.Release)
+    GitConfigSet("credential.helper", "store")
+    print(f"### Token saved to {credentials_file} and credential helper configured.")
 
-    print(f"### Token saved to {git_credentials_file} and credential helper configured.")
 
-    # Verify the token works by testing access to the GitHub API
-    print("### Verifying token access to GitHub...")
-    ret = os.system(
-        f'git ls-remote https://github.com/{github_account}/{scripts_repo}.git HEAD > /dev/null 2>&1'
-    )
-    if ret != 0:
-        print(f"### Error: Could not access {github_account}/{scripts_repo} with the provided token.")
-        if not nv_configs.YesNo("Continue anyway?"):
-            exit(1)
-    else:
-        print(f"### Token verified — access to {github_account}/{scripts_repo} confirmed.")
-
-    return token
+def SetupGhCli(nv_configs: NvConfigs, token: str):
+    """Authenticate the gh CLI with the same token (gh is used by the nv* scripts)."""
+    if not shutil.which("gh"):
+        return
+    if not nv_configs.YesNo("Authenticate the gh CLI with this token?", def_input=True):
+        return
+    res = subprocess.run(["gh", "auth", "login", "--with-token"], input=token + "\n", text=True)
+    if res.returncode != 0:
+        print("## Warning: 'gh auth login' failed. Run it manually: gh auth login")
+        return
+    print("### gh CLI authenticated")
 
 
 def CloneScriptsRepository(scripts_dir: str, gitaccount: str, use_pat: bool = False):
     # clone the nvscripts repository under the scripts_dir
-    if use_pat:
-        repo_url = f"https://github.com/{github_account}/{scripts_repo}.git"
-    else:
-        repo_url = f"git@{gitkeyname}:{github_account}/{scripts_repo}.git"
-    gitcmd = f"git clone {repo_url} --origin {github_remote} {scripts_dir}"
-    print(f"### {gitcmd}")
-    ret = os.system(gitcmd)
-    if ret != 0:
-        raise Exception(f"### Failed to clone nvscripts repository under {scripts_dir}")
+    repo_url = RepoUrl(scripts_repo, gitaccount, use_pat)
+    print(f"### git clone {repo_url} --origin {github_remote} {scripts_dir}")
+    if RunGit(["clone", repo_url, "--origin", github_remote, scripts_dir]) != 0:
+        print(f"### Error: Failed to clone {scripts_repo} under {scripts_dir}", file=sys.stderr)
+        if use_pat:
+            print(
+                f"###        Make sure your token has at least read access to {gitaccount}/{scripts_repo}"
+                f" and re-run the setup with -u to enter a new one.",
+                file=sys.stderr,
+            )
+        else:
+            print(f"###        Make sure the {gitkeyname} ssh key is registered on GitHub.", file=sys.stderr)
+        exit(1)
 
     print(f"### Cloned nvscripts repository under {scripts_dir}")
     # Ensure scripts_dir is in the path, if not add it to the bashrc
@@ -329,11 +511,9 @@ def CheckConfig(nv_configs: NvConfigs) -> Dict[str, Any]:
     return missing_vars
 
 
-def CheckRequiredTools(use_pat: bool = False):
+def CheckRequiredTools():
     """Check that required CLI tools are installed."""
     required = [("git", "sudo apt install git")]
-    if use_pat:
-        required.append(("gh", "sudo apt install gh  (or see https://cli.github.com)"))
     missing = []
     for tool, install_hint in required:
         if not shutil.which(tool):
@@ -341,8 +521,30 @@ def CheckRequiredTools(use_pat: bool = False):
     if missing:
         print("### Error: The following required tools are not installed:", file=sys.stderr)
         for tool, hint in missing:
-            print(f"###   {tool} — install with: {hint}", file=sys.stderr)
+            print(f"###   {tool} - install with: {hint}", file=sys.stderr)
         exit(1)
+
+
+def EnsureGhInstalled(nv_configs: NvConfigs) -> bool:
+    """Make sure the gh CLI is available, offering to install it when it is missing."""
+    if shutil.which("gh"):
+        print(f"### gh CLI is installed ({shutil.which('gh')})")
+        return True
+
+    print("### The gh CLI (GitHub command line tool) is required but not installed.")
+    if nv_configs.YesNo("Install it now with 'sudo apt install gh'?", def_input=True):
+        ret = os.system("sudo apt-get update && sudo apt-get install -y gh")
+        if ret == 0 and shutil.which("gh"):
+            print(f"### Installed gh CLI ({shutil.which('gh')})")
+            return True
+        print("## Warning: failed to install gh from the distribution packages.")
+        print("##          Install it manually, see https://github.com/cli/cli/blob/trunk/docs/install_linux.md")
+
+    if not nv_configs.YesNo("Continue the setup without the gh CLI?", def_input=False):
+        print("### Aborting... install gh and re-run the setup.")
+        exit(1)
+    print("## Warning: continuing without the gh CLI")
+    return False
 
 
 def main():
@@ -351,11 +553,16 @@ def main():
     parser.add_argument(
         "--pat",
         action="store_true",
-        help="Use a Personal Access Token (PAT) for GitHub authentication instead of SSH key",
+        help="Use a GitHub Personal Access Token over HTTPS (default when nothing is configured yet)",
+    )
+    parser.add_argument(
+        "--ssh",
+        action="store_true",
+        help="Use an SSH key for GitHub authentication instead of a PAT",
     )
     args = parser.parse_args()
 
-    CheckRequiredTools(use_pat=args.pat)
+    CheckRequiredTools()
 
     try:
         # First Init/Update the configuration
@@ -372,18 +579,39 @@ def main():
                         exit(1)
 
         print("### Configuration is valid. Continuing with setup...")
+
+        # Release the ~/.gitconfig lock: from here on the setup runs git commands that write
+        # the global configuration, and they fail while GitPython holds the lock.
+        nv_configs.Release()
+
+        gitaccount = nv_configs.GetConfig("github.account")
+        assert isinstance(gitaccount, str) and gitaccount != "", f"github.account is not set/bad {gitaccount}"
+
         # Check if ~/bin exists, if not create it, anyhow check that it is in the path
         bin_dir = os.path.expanduser("~/bin")
         if not os.path.exists(bin_dir):
             if nv_configs.YesNo(f"Create ~/bin directory and add it to the path?", def_input=True):
                 CreateBinDirectory(bin_dir)
 
-        # Setup GitHub authentication (SSH key or PAT)
-        use_pat = args.pat
+        # The gh CLI is used by the nv* scripts (and to authenticate with the PAT)
+        EnsureGhInstalled(nv_configs)
+
+        # Setup GitHub authentication (PAT over HTTPS or SSH key)
+        use_pat = GetAuthMethod(nv_configs, args) == auth_pat
         if use_pat:
-            if nv_configs.YesNo("Setup Personal Access Token (PAT) for GitHub?", def_input=True):
-                SetupPatToken(nv_configs)
+            # Re-use the stored token unless it is missing, invalid, or an update was requested
+            if HasPatCredentials() and not args.update:
+                ConfigureHttpsRewrites()
+                print("### A GitHub token is already stored, verifying it...")
+                if VerifyGitHubAccess(gitaccount, [scripts_repo, setup_repo]):
+                    print("### Stored token is valid (use -u to replace it)")
+                elif nv_configs.YesNo("Setup a new Personal Access Token (PAT) for GitHub?", def_input=True):
+                    SetupPatToken(nv_configs, gitaccount)
+            elif nv_configs.YesNo("Setup a Personal Access Token (PAT) for GitHub?", def_input=True):
+                SetupPatToken(nv_configs, gitaccount)
         else:
+            # SSH urls must not be rewritten to HTTPS when authenticating with a key
+            RemoveHttpsRewrites()
             if not os.path.exists(os.path.expanduser(f"~/.ssh/{gitkeyname}")):
                 if nv_configs.YesNo(f"Create ssh key {gitkeyname}?", def_input=True):
                     SetupSshKey(nv_configs)
@@ -393,18 +621,17 @@ def main():
 
         # Create global navona scripts directory if it doesn't exist
         scripts_dir = os.path.expanduser(nvscripts_dir)
-        gitaccount = nv_configs.GetConfig("github.account")
-        assert isinstance(gitaccount, str) and gitaccount != "", f"github.account is not set/bad {gitaccount}"
-        if not os.path.exists(scripts_dir):
-            if nv_configs.YesNo(
+        if not os.path.isdir(os.path.join(scripts_dir, ".git")):
+            if os.path.exists(scripts_dir):
+                print(f"## Warning: {scripts_dir} exists but is not a git repository, remove it and re-run the setup")
+            elif nv_configs.YesNo(
                 f"Clone nvscripts repository under {scripts_dir} (also used for global git hooks)?", def_input=True
             ):
                 CloneScriptsRepository(scripts_dir, gitaccount, use_pat=use_pat)
         else:
             print(f"### nvscripts repository already exists under {scripts_dir}")
             # Pull latest changes to ensure navona-scripts is up to date
-            ret = os.system(f"git -C {scripts_dir} pull --rebase")
-            if ret != 0:
+            if RunGit(["-C", scripts_dir, "pull", "--rebase"]) != 0:
                 print(f"## Warning: Failed to update navona-scripts in {scripts_dir}")
             else:
                 print(f"### Updated navona-scripts to latest version")
@@ -421,7 +648,8 @@ def main():
         assert isinstance(hookspath, str) and hookspath != "", f"core.hookspath is not set/bad {hookspath}"
         gitpath = os.path.expanduser(hookspath)
         if not os.path.exists(gitpath):
-            os.makedirs(gitpath)
+            # Do not create it under a missing navona-scripts clone: an empty directory there
+            # would make the next run believe the repository is already cloned.
             print(f"## Warning: {hookspath} directory does not exist! (clone nvn-scripts)")
         else:
             print(f"### Global git hooks directory {gitpath} exists")
@@ -438,7 +666,15 @@ def main():
             print(f"### Global git hooks file {os.path.join(gitpath, "navona-tech-pre-commit")} exists")
 
         print("\n### Setup completed successfully.")
-        print(f"   - Read {os.path.join(scripts_dir, "README.md")} file for more information.\n")
+        print(f"   - Read {os.path.join(scripts_dir, "README.md")} file for more information.")
+        if use_pat:
+            print(f"   - GitHub is accessed over HTTPS with your Personal Access Token.")
+            print(f"     The token needs at least READ access to {gitaccount}/{scripts_repo} and")
+            print(f"     {gitaccount}/{setup_repo}, and READ AND WRITE access to every repository")
+            print(f"     you want to work on. Re-run with -u to replace an expired token.")
+        else:
+            print(f"   - GitHub is accessed over SSH with the {gitkeyname} key.")
+        print("")
 
     except KeyboardInterrupt:
         print("\n### Setup aborted.\n")
